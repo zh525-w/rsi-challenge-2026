@@ -1,0 +1,56 @@
+万有引力｜智训引擎 RSI CHALLENGE（2026 北京市大学生「人工智能+」创新大赛）
+模型调用信息与提交镜像说明（v2.8，2026-11-23）
+
+一、驱动模型（Harness 调用，非被评的工业模型）
+- 平台侧驱动模型：官方基础模型 Qwen3.8-27B（满足“不超过 27B”上限），经平台网关调用
+- 调用方式：每轮训练恰好 1 次 rnd.model()（读历史摘要→给出本轮超参 JSON），回执 call_id 写入 rnd.finish(model_call_ids)
+- 决策上下文注入按数据集整理的离线经验配方（RECIPE_HINTS，来自 2026-11-22~23 多批共 400+ 轮调优实验的最终成功轨迹；本版按 tune12/13 扫描结果更新 B/C 两链），引导决策模型复现；仅影响提示词文本，不影响训练数值路径
+- 回复解析失败时回退按数据集默认超参，该次调用号仍如实计入
+- 密钥：只填平台“密钥”栏，镜像与源码内不含任何密钥
+
+二、PyTRiO 自选模型微调（可选驱动模型，计入分数）
+- 基模：Qwen/Qwen3.5-4B（PyTRiO 平台可选 4B/27B 中的 4B，满足 ≤27B 上限）
+- 方式：PyTRiO LoRA SFT（rank=32，Adam lr=1e-4，batch=8），SDK pytrio 0.2.9
+- 训练数据：218 条去重决策样本（pytrio_sft.jsonl），全部由本地离线实验证据重建：
+  每轮“决策上下文（数据集统计+父模型分数+经验配方提示+历史轮次摘要）→ 该轮公开验证最优候选超参 JSON”；
+  含静态配方链与模型驱动闭环链（DAgger：把微调模型实际走出的上下文及对应最优决策回灌训练集）
+- 迭代：v1（145 样本/3ep，token loss 0.158，抽样评测 10/10 合法 JSON、2/10 与最优一致）→
+  v2（145 样本/6ep，loss 0.077，6/10 一致）→ v3（218 样本/6ep，loss 0.069，6/10 一致，覆盖闭环真实分布）
+- 权重（save_weights_for_sampler）：
+  v3（推荐）：trio://run_ny3dlotzabt9/sampler_weights/rsi-decider-4b-v3
+  v2（备用）：trio://run_4de68a8nw1vp/sampler_weights/rsi-decider-4b-v2
+  v1：trio://run_x7ko1opmpz4k/sampler_weights/rsi-decider-4b-v1
+- 闭环实证（v2 权重驱动本地 Harness 协议全闭环，3×10 轮，公开验证集）：
+  A 0.714030→0.729524（2 采纳）；B 681.160→631.104（1 采纳）；C 52.869→50.584（10 轮全采纳，
+  微调模型发现的“长 epoch 低 lr 阶梯”策略成为 C 链后续持续优化的源头，本版 C 定稿 50.530，见第五节）
+- 训练全程无隐藏测试数据、无平台外数据；仅用赛题随包公开数据的离线实验记录
+
+三、提交镜像（本版 v2.8）
+- 文件：rsi-cpu-abc-2.8.tar（docker save 导出）
+- sha256：db5d65f7c9dc9e139ab78a9a814745e2db77f5d669c94ff65c6886b4c2678eea（大小 125,803,008 字节）
+- 基础层：python:3.10.11-alpine（digest def82962a6ee…），linux/amd64
+- 内容：contest_harness 1.0.4（官方 SDK，vendored，产物提交走 chunked-v1 分块上传）、固定入口 /app/harness.py、选手模块 /app/contest_submission.py、官方 baselines 模型代码（contest.cpu-mlp.v1）
+- 不含：密钥、公开数据、父检查点（由平台挂载 /data、/previous、/model）
+- 平台调用：python3 /app/harness.py describe|train|predict；describe 输出
+  {"protocol":"contest.harness.workspace.v2","model_access":"host_gateway_rpc","sdk":"contest_harness","sdk_version":"1.0.4","tasks":["classification","regression"]}
+- 与 v2.7 镜像的差异：仅更新选手模块内的 B/C 链经验配方提示与离线工具 DECIDER 阶梯（训练机制、依赖、入口完全一致）
+
+四、训练机制（v2.5 机制，随镜像 2.8 提交）
+- 在 v2.3/v2.4（5% warmup + 余弦 lr、EMA(0.999) 权重与矩平均、epoch≤600、多候选对照）基础上新增：
+  1) 每轮 4 个候选：主配置 + lr×0.6/ep×1.6 + lr×1.6/ep×0.6 + 正则变体（分类标签平滑 0.05 / 回归输入噪声 0.01），后三者采样种子偏移（101/202/303）增加探索多样性
+  2) SWA：对每候选取验证最优 top-3 epoch 快照做权重与 Adam 矩平均，与逐 epoch 原始/EMA 快照一同竞争本轮最优
+  3) 决策模型可选参数 label_smoothing(0-0.2)/input_noise(0-0.1) 进入解析白名单
+- 检查点格式、网络结构、输入维度、类别、预测路径均与官方基线一致；变差即回滚保留父 artifact
+
+五、离线验证（公开验证集自测，每数据集 10 轮，起点均为官方 baseline 父检查点；镜像 2.8 容器内定稿跑）
+- A Macro-F1：0.714030（基线）→ 0.743865（最终 art-a-r7，7 采纳/3 回滚；ls0.15 与 0.004/45/96/0.1 两步收官，tune12 a6/a7 复核饱和）
+- B RMSE 分钟：681.159833（基线）→ 617.480162（最终 art-b-r1，热开局 0.005/10/128/0.1 单步 −63.7，1 采纳/9 回滚）
+- C RMSE 循环：52.868573（基线）→ 50.529883（最终 art-c-r10，10 轮全采纳；陡爬坡阶梯 epoch 46→104 + 末轮 0.0009/96/256/0.03 收尾）
+- tune12/13 扫描（2026-11-23，共 11 条链）：B 新最优 617.480（b9 首步，b8/b9/b10/b11 共 36 组邻域探测全部回滚，最接近 619.204；两个最优点累计 70+ 组扰动确认饱和）；C 新最优 50.5299（c8，c7/c9/c10/c11 五个收尾变体全部更差，C 家族收敛）；A 复核维持 0.743865（a6/a7 共 12 组探测回滚）
+- 复现性：B 链 r1 在三次独立跑批逐位一致；C 链 c7/c8 前 8 轮与 c4 逐位一致；A 链 a4/a6/a7 末值逐位一致；镜像 2.8 容器 final28 定稿跑与调优跑一致（C 与云主机间如有 1 ulp 差异源于 BLAS 线程数，不影响采纳决策）
+- SDK 1.0.4 官方单元测试 18/18 通过；容器内 describe / predict 冒烟通过；predict 输出与参考加载器 baselines/predict.py 逐行一致
+- 正式成绩以平台隐藏测试评测为准
+
+六、许可与来源
+numpy 1.26.4（BSD-3-Clause)、contest_harness 1.0.4（官方 SDK）、baselines（赛题随包）、pytrio 0.2.9（MIT，仅本地微调驱动模型使用，不在提交镜像内）、其余为标准库。
+未使用隐藏测试标签，未引入平台外数据；经验配方与微调数据全部来自赛题随包公开数据的离线实验。
