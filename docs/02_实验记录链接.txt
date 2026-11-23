@@ -1,0 +1,8 @@
+实验记录链接（SwanLab 公开台账）
+
+项目地址：https://swanlab.cn/@slience917/rsi-abc-2026
+账号：@slience917
+
+内容：共 39 个 run，覆盖 A（气体六分类）、B（轴承 RUL）、C（发动机 RUL）三个数据集的全部离线续训链，逐轮记录父检查点值、候选配置值、增益、是否采纳及超参（lr、epochs、batch_size、lr_end_ratio、noise、smooth 等），另含一个 baseline 与 v2.4–v2.8 的版本定稿对照 run。
+
+本地补充台账：docs/04_实验记录-三数据集离线续训-v28.md

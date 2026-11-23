@@ -1,0 +1,18 @@
+来源声明（外部代码、数据与模型）
+
+队名：万有引力　　日期：2026-11-24
+
+一、代码
+1. contest_submission.py：以组委会提供的官方 baseline 提交模板为基础修改，实现 A/B/C 三数据集各 10 轮链式续训策略，训练与调度代码为本队自研。
+2. harness.py、requirements.txt：组委会 Harness SDK 1.0.4 原样使用，未修改。
+3. 除上述官方材料外，未使用其他第三方开源代码。
+
+二、数据
+A（气体六分类）、B（轴承 RUL）、C（发动机 RUL）三个数据集及各轮 baseline 父检查点均由赛事官方提供，未引入任何外部数据。
+
+三、模型
+1. 训练与评测仅通过组委会指定的模型网关调用驱动模型，网关地址、API Key、Base URL 见 docs/01_模型调用信息-v6.txt。
+2. 可选的 PyTRiO 微调权重 rsi-decider-4b-v3（trio://run_ny3dlotzabt9/sampler_weights/rsi-decider-4b-v3）为本队基于赛事数据自训，基座为平台提供的 4B 模型，不使用则回退网关模型。
+
+四、实验记录
+全部实验记录由本队自行上传至 SwanLab 公开项目，链接见 docs/02_实验记录链接.txt，数据可公开核验。
