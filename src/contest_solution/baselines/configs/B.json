@@ -1,0 +1,10 @@
+{
+  "profile": "B",
+  "task": "classification",
+  "classes": ["Normal", "Degrading", "SevereFault"],
+  "hidden": 24,
+  "seed": 42,
+  "learning_rate": 0.003,
+  "batch_size": 128,
+  "epochs": 15
+}

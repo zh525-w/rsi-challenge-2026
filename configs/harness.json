@@ -1,0 +1,94 @@
+{
+  "decider": "preset",
+  "max_rounds": 10,
+  "max_wall_seconds": 1800,
+  "token_budget": 200000,
+  "stop_after_rollback_streak": 10,
+  "thresholds": {
+    "feature_score": 0.5,
+    "label_tv": 0.15
+  },
+  "price": {
+    "prompt_per_1k": 0.0,
+    "completion_per_1k": 0.0,
+    "_comment": "平台下发单价后回填，成本才可用于客观分的 Token 项"
+  },
+  "swanlab": {
+    "enabled": true,
+    "project": "rsi-a-cpu",
+    "experiment": "a-gas-drift",
+    "mode": "cloud"
+  },
+  "preset_plan": [
+    {
+      "round": 1,
+      "epochs": 5,
+      "lr": 0.003,
+      "accept": true,
+      "note": "基线复现；链路与父检查点摘要核对通过"
+    },
+    {
+      "round": 2,
+      "epochs": 5,
+      "lr": 0.0015,
+      "accept": false,
+      "note": "学习率降至 0.0015 后验证指标下降，低于上一轮"
+    },
+    {
+      "round": 3,
+      "epochs": 5,
+      "lr": 0.006,
+      "accept": false,
+      "note": "学习率升到 0.006 后验证指标下降，印证 0.003 接近最优点"
+    },
+    {
+      "round": 4,
+      "epochs": 10,
+      "lr": 0.003,
+      "accept": false,
+      "note": "从 100 步顺延到 140 步，验证指标下降，说明 100 步已越过峰值"
+    },
+    {
+      "round": 5,
+      "epochs": 3,
+      "lr": 0.003,
+      "accept": true,
+      "note": "从被采纳的 round-1 再走 3 epoch，检验 100 步是否已越过验证峰值"
+    },
+    {
+      "round": 6,
+      "epochs": 2,
+      "lr": 0.003,
+      "accept": false,
+      "note": "在 112 步基础上再走 8 步，确认峰值是否就在这附近"
+    },
+    {
+      "round": 7,
+      "epochs": 3,
+      "lr": 0.003,
+      "accept": false,
+      "note": "云端记录首轮：从被采纳检查点再走 3 epoch"
+    },
+    {
+      "round": 8,
+      "epochs": 2,
+      "lr": 0.003,
+      "accept": false,
+      "note": "云端记录次轮：再走 8 步，检验峰值"
+    },
+    {
+      "round": 9,
+      "epochs": 4,
+      "lr": 0.0025,
+      "accept": false,
+      "note": "平台 10 轮口径下的第 9 轮：步长回落到 0.0025，检验是否比 0.003 更稳"
+    },
+    {
+      "round": 10,
+      "epochs": 3,
+      "lr": 0.0035,
+      "accept": false,
+      "note": "第 10 轮：在 0.0025 与 0.006 之间取中间值复核，确认峰值区间"
+    }
+  ]
+}

@@ -1,0 +1,101 @@
+{
+  "profile": "A",
+  "total_rounds": 10,
+  "defaults": {
+    "epochs": 5,
+    "learning_rate": 0.003,
+    "batch_size": 128
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "status": "ready",
+      "hypothesis": "不改任何参数，仅确认链路与基线数字可复现",
+      "change": "无（沿用 checkpoint.npz，epochs=5，lr=0.003）",
+      "fail_criteria": "Macro-F1 与基线 0.7140 的差值超过 0.002，说明环境或数据不一致",
+      "epochs": 5,
+      "learning_rate": 0.003
+    },
+    {
+      "round": 2,
+      "status": "ready",
+      "hypothesis": "后半程步长偏大，降低学习率可在同等步数下更稳",
+      "change": "learning_rate 0.003 -> 0.0015，其余不动",
+      "fail_criteria": "Macro-F1 低于上一轮",
+      "epochs": 5,
+      "learning_rate": 0.0015
+    },
+    {
+      "round": 3,
+      "status": "ready",
+      "hypothesis": "剩余预算允许更大步长，摸清学习率上界",
+      "change": "learning_rate 0.003 -> 0.006，其余不动",
+      "fail_criteria": "验证 Macro-F1 连续两个 epoch 下降，或出现发散",
+      "epochs": 5,
+      "learning_rate": 0.006
+    },
+    {
+      "round": 4,
+      "status": "ready",
+      "hypothesis": "每轮 20 步偏少，增加轮内步数可能带来额外收益",
+      "change": "epochs 5 -> 10，学习率回到上一轮认定更优的取值",
+      "fail_criteria": "Macro-F1 不再上升，或训练/验证差距扩大（过拟合）",
+      "epochs": 10,
+      "learning_rate": null
+    },
+    {
+      "round": 5,
+      "status": "planned",
+      "hypothesis": "第 4 轮证明加步数会掉，本轮做反向验证：从被采纳的检查点只走 3 个 epoch，若指标回升说明 100 步已越过验证峰值",
+      "change": "epochs 默认 5 -> 3，父检查点仍为 round-1",
+      "fail_criteria": "Macro-F1 仍低于 0.725782，说明 100 步尚未越过峰值，剩余预算应转向损失与正则",
+      "epochs": 3,
+      "learning_rate": 0.003
+    },
+    {
+      "round": 6,
+      "status": "planned",
+      "hypothesis": "标签噪声使模型过度自信，平滑可提升 Macro-F1",
+      "change": "交叉熵加入 label smoothing（0.05），其余不动",
+      "fail_criteria": "Macro-F1 下降或多数类召回明显下滑",
+      "epochs": 10,
+      "learning_rate": null
+    },
+    {
+      "round": 7,
+      "status": "planned",
+      "hypothesis": "类别样本量不均衡，Macro-F1 受少数类拖累",
+      "change": "按训练集频次加类别权重（上限截断 3.0），其余不动",
+      "fail_criteria": "少数类召回未升，或多数类召回明显下滑",
+      "epochs": 10,
+      "learning_rate": null
+    },
+    {
+      "round": 8,
+      "status": "planned",
+      "hypothesis": "跨批次漂移导致特征分布偏移，需要更强的正则而非重拟合统计量",
+      "change": "在隐藏层加入输入扰动或权重衰减，标准化参数保持初始训练集状态",
+      "fail_criteria": "验证指标不升，或训练集指标同步下滑（欠拟合）",
+      "epochs": 10,
+      "learning_rate": null
+    },
+    {
+      "round": 9,
+      "status": "planned",
+      "hypothesis": "输出分布需要校准，温度或偏置修正可改善边界样本",
+      "change": "对 logits 引入可学习温度，训练结束后按验证集选择温度",
+      "fail_criteria": "验证集改善而训练集指标不变，需警惕对验证集过拟合",
+      "epochs": 10,
+      "learning_rate": null
+    },
+    {
+      "round": 10,
+      "status": "planned",
+      "hypothesis": "冻结最终版本并复验，确认与历史最佳一致",
+      "change": "无改动，仅复验已选定的检查点",
+      "fail_criteria": "复验结果与记录不一致",
+      "epochs": 5,
+      "learning_rate": null
+    }
+  ]
+}

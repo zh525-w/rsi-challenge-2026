@@ -1,0 +1,19 @@
+{
+  "schema": "contest.harness.workspace.v2",
+  "sdk": "contest_harness",
+  "sdk_version": "1.0.2",
+  "team": "人工智能+",
+  "entry": "/app/harness.py",
+  "participant_module": "/app/contest_submission.py",
+  "task_entry": "contest_submission.train(rnd)",
+  "predict_entry": "contest_submission.predict(sample, model_dir)",
+  "predict_argv": ["python3", "/app/harness.py", "predict"],
+  "datasets": {
+    "A": {"task": "classification", "metric": "macro_f1", "features": 128, "unit": "气体类别"},
+    "B": {"task": "regression", "metric": "rmse", "features": 34, "unit": "分钟（XJTU-SY 轴承 RUL）"},
+    "C": {"task": "regression", "metric": "rmse", "features": 24, "unit": "周期（C-MAPSS FD001 RUL）"}
+  },
+  "model_access": "host_gateway_rpc",
+  "modules": ["contest_submission.py", "rsi/core.py"],
+  "legacy": "legacy/ 是 SDK 到手前的自研适配层，仅供追溯，平台不使用"
+}
