@@ -1,8 +1,0 @@
-runs/
-logs/
-results/
-*.zip
-*.tar
-__pycache__/
-*.pyc
-.venv/
