@@ -125,6 +125,8 @@ class Net(object):
         self.scale = np.ones(n_features)
         self.target_mean = 0.0
         self.target_scale = 1.0
+        self.log_target = False
+        self.target_cap = None
         self.classes = []
         self.paths = []
         self.step = 0
@@ -142,7 +144,13 @@ class Net(object):
     def predict(self, x):
         z = self.logits(x)
         if self.kind == "regression":
-            return np.maximum(0.0, z[:, 0] * self.target_scale + self.target_mean)
+            value = z[:, 0] * self.target_scale + self.target_mean
+            if self.log_target:
+                value = np.expm1(value)
+            value = np.maximum(0.0, value)
+            if self.target_cap is not None:
+                value = np.minimum(value, float(self.target_cap))
+            return value
         return _softmax(z)
 
     def _backward(self, x, grad_z):
@@ -168,7 +176,8 @@ class Net(object):
                 xb, yb = x[index], y[index]
                 z = self.logits(xb)
                 if self.kind == "regression":
-                    target = ((yb - self.target_mean) / self.target_scale).reshape(-1, 1)
+                    base = np.log1p(np.maximum(yb, 0.0)) if self.log_target else yb
+                    target = ((base - self.target_mean) / self.target_scale).reshape(-1, 1)
                     grad_z = 2.0 * (z - target) / max(len(yb), 1)
                 else:
                     prob = _softmax(z)
@@ -203,6 +212,8 @@ class Net(object):
             "paths": self.paths,
             "target_mean": float(self.target_mean),
             "target_scale": float(self.target_scale),
+            "log_target": bool(self.log_target),
+            "target_cap": (None if self.target_cap is None else float(self.target_cap)),
             "feature_clip": [-CLIP, CLIP],
             "parameter_count": int(self.w1.size + self.b1.size + self.w2.size + self.b2.size),
             "feature_count": int(self.w1.shape[0]),
@@ -238,6 +249,9 @@ class Net(object):
             net.paths = parse_paths(meta.get("paths")) or list(meta.get("paths") or [])
             net.target_mean = float(meta.get("target_mean", 0.0))
             net.target_scale = float(meta.get("target_scale", 1.0)) or 1.0
+            net.log_target = bool(meta.get("log_target", False))
+            cap = meta.get("target_cap")
+            net.target_cap = None if cap is None else float(cap)
             net.step = int(meta.get("adam_steps", 0))
             return net, meta
 
