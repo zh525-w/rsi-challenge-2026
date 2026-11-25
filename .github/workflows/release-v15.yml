@@ -1,0 +1,26 @@
+name: release-v15-image
+
+on:
+  push:
+    paths:
+      - '.github/workflows/release-v15.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download image
+        run: |
+          curl -L --fail --max-time 300 -o rsi-a-cpu-1.0-alpine-v15.tar.gz "https://aka.doubaocdn.com/s/1ojGBFRNdl"
+          echo "169521da03e68d55938d0fc8f65e80ccef8c03c3108eb7f19630c2710bd782c5  rsi-a-cpu-1.0-alpine-v15.tar.gz" | sha256sum -c -
+      - name: Create release with asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create v15-image rsi-a-cpu-1.0-alpine-v15.tar.gz \
+            --title "v15 CPU image (B log1p + C cap 600)" \
+            --notes "rsi-a-cpu-1.0-alpine-v15.tar.gz, 38,491,175 B; inner tar sha256 e4a93b5d14d5f8cf06b34bca9b745aecca5f22e2aacd1604c2faaa44790d22fb"
