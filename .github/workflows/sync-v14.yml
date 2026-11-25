@@ -1,0 +1,36 @@
+name: sync-v14
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sync-v14.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download submitted package
+        run: |
+          curl -L --fail -o pkg.zip "https://aka.doubaocdn.com/s/UVXXtEQGxp"
+          unzip -o pkg.zip -d pkg
+          unzip -o "pkg/万有引力_智训引擎_2026-11-19/智训引擎-项目源代码.zip" -d src
+      - name: Replace code with v14
+        run: |
+          cp -f src/contest_solution/contest_submission.py .
+          cp -f src/contest_solution/harness.py .
+          cp -f src/contest_solution/requirements.txt .
+          cp -f src/contest_solution/adapter_manifest.json .
+          mkdir -p rsi configs
+          cp -rf src/contest_solution/rsi/. rsi/
+          cp -rf src/contest_solution/configs/. configs/
+      - name: Commit
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add -A
+          git commit -m "v14: sync contest_submission.py and rsi core from submitted package" || exit 0
+          git push
