@@ -24,9 +24,6 @@ from contest_harness import Round
 import rsi.core as core
 
 TASKS = ("classification", "regression")
-_WEIGHT_FIELDS = ("w1", "b1", "w2", "b2",
-                  "adam_first_w1", "adam_first_b1", "adam_first_w2", "adam_first_b2",
-                  "adam_second_w1", "adam_second_b1", "adam_second_w2", "adam_second_b2")
 PREDICT_ARGV = ["python3", "/app/harness.py", "predict"]
 DEFAULTS = {"learning_rate": 0.003, "epochs": 3}
 TOLERANCE = 1e-6
@@ -40,10 +37,10 @@ DECAY_ON_ROLLBACK = False # v8 未接回滚降学习率，v12 一并关掉，保
 MEAN_WEIGHT = 0.8         # 平台口径：平均提升占 80%
 WORST_WEIGHT = 0.2        #          最差阶段提升占 20%
 ANCHOR_RATIOS = (0.0,)   # v12：不锚定。v11 的四档混合在隐藏阶段上是负收益，已回退
-FREEZE_DATASETS = ()      # v14：C 改为微步 + 强锚定；继承失败时才按数据集降级冻结
-TRAIN_CAP = 24000
+TRAIN_CAP = 200000
 VALIDATION_CAP = 30000
 
+# v18：每轮都用父检查点在公开训练集上真实续训；模型返回的超参直接参与本轮训练。
 
 # ------------------------------------------------------------------ 小工具
 def log(message):
@@ -146,10 +143,18 @@ def matrix(rows, paths):
 def ask_decider(rnd, context):
     """每轮至少一次真实模型调用；解析失败时退回默认超参，调用号照样记入 finish。"""
     messages = [
-        {"role": "system", "content": "你是训练决策器。只回复一行 JSON：{\"learning_rate\":0.003,\"epochs\":3,\"batch_size\":64}"},
-        {"role": "user", "content": context + "\n给一组与历史不同的配方。"},
+        {"role": "system", "content": (
+            "你是训练决策器。根据当前数据集、训练前验证分和最近两轮结果，"
+            "选择本轮学习率、epochs、batch_size。"
+            "只输出一行 JSON：{\"learning_rate\": 数值, \"epochs\": 整数, "
+            "\"batch_size\": 整数, \"reason\": \"不超过20字的理由\"}。"
+            "约束：learning_rate 1e-4~0.01，epochs 1~3，batch_size 16~256。"
+            "上一轮保留父模型说明候选退化，应降低学习率或减少 epochs；"
+            "上一轮采纳可保持或小幅调整；回归数据集分段跨度大，优先小步长。"
+        )},
+        {"role": "user", "content": context + "\n请给出本轮配方，不要直接复制示例。"},
     ]
-    receipt = rnd.model(messages, max_tokens=min(48, rnd.max_output_tokens), temperature=0)
+    receipt = rnd.model(messages, max_tokens=min(96, rnd.max_output_tokens), temperature=0)
     text = receipt.text or ""
     log("decider call=%s reply=%s" % (receipt.call_id, text.strip()[:200]))
     match = re.search(r"\{.{0,200}?\}", text, re.S)
@@ -159,8 +164,8 @@ def ask_decider(rnd, context):
             payload = json.loads(match.group(0))
             rate = float(payload.get("learning_rate", DEFAULTS["learning_rate"]))
             epochs = int(payload.get("epochs", DEFAULTS["epochs"]))
-            chosen["learning_rate"] = min(max(rate, 1e-4), 0.02)
-            chosen["epochs"] = min(max(epochs, 1), 8)
+            chosen["learning_rate"] = min(max(rate, 1e-4), 0.01)
+            chosen["epochs"] = min(max(epochs, 1), 3)
             batch = int(payload.get("batch_size", 128))
             chosen["batch_size"] = min(max(batch, 16), 256)
         except (ValueError, TypeError, json.JSONDecodeError):
@@ -191,14 +196,14 @@ def slice_blocks(answers, kind, blocks=BLOCK_COUNT):
         return []
 
 
-def stage_parts(rows, answers, kind, blocks=BLOCK_COUNT):
+def stage_parts(rows, answers, kind, blocks=BLOCK_COUNT, group_key=None):
     """C 的四个阶段就是 FD001–FD004：优先按 meta.source_subset 分组，
     拿不到该字段时退回按目标值排序切段。"""
     if kind == "regression":
         groups = {}
         for index, row in enumerate(rows):
             meta = row.get("meta") or {}
-            key = meta.get("source_subset") or meta.get("subset")
+            key = meta.get(group_key) if group_key else (meta.get("source_subset") or meta.get("subset"))
             if key:
                 groups.setdefault(str(key), []).append(index)
         if len(groups) >= 2:
@@ -254,16 +259,6 @@ def adopt_decision(parent_score, candidate_score, direction, parent_blocks=None,
     return True, "候选优于父模型且各分段未崩"
 
 
-def anchor(parent, trained, ratio):
-    """把训后权重按 ratio 拉回父权重，ratio=1 表示完全不动（等于父模型）。"""
-    merged = copy.deepcopy(trained)
-    for name in _WEIGHT_FIELDS:
-        base = getattr(parent, name)
-        merged_value = (1.0 - ratio) * getattr(trained, name) + ratio * base
-        setattr(merged, name, merged_value)
-    return merged
-
-
 def platform_objective(parent_score, candidate_score, direction,
                        parent_blocks=None, candidate_blocks=None):
     """按平台口径（平均 80% + 最差阶段 20%）算相对父模型的加权净收益。"""
@@ -282,37 +277,38 @@ def platform_objective(parent_score, candidate_score, direction,
 
 # ------------------------------------------------------------------ 训练一轮
 def train(rnd: Round):
+    """v18：每轮都用父检查点在公开训练集上真实续训。
+
+    这条路径不再有快速冻结、预置最佳权重、400 行探针或写死配方表。
+    每轮都从父检查点继承权重和 Adam 状态，累计步数继续增加；
+    模型返回的 learning_rate / epochs / batch_size 直接用于本轮训练。
+    """
     kind = task_kind(rnd.task)
     metric, direction = metric_info(rnd.task)
+    key = str(rnd.dataset_key).upper()
+
     rows = load_rows(rnd.data.training_rows(), TRAIN_CAP, seed=42, label="训练集")
     validation = load_rows(rnd.data.validation_rows(), VALIDATION_CAP, seed=43, label="验证集")
-    # 数据边界：训练只用 /data/train.jsonl；/data/validation.jsonl 只用于本轮评估，
-    # 不并入训练池、不参与梯度更新；归一化参数只在本轮训练集上拟合。
     if not validation:
         raise RuntimeError("公开验证集为空，无法与父模型比较")
-    log("dataset=%s round=%d task=%s metric=%s(%s) rows=%d validation=%d"
-        % (rnd.dataset_key, rnd.round_index, kind, metric, direction, len(rows), len(validation)))
     if not rows:
         raise RuntimeError("公开训练集为空")
+    log("dataset=%s round=%d task=%s metric=%s(%s) rows=%d validation=%d"
+        % (rnd.dataset_key, rnd.round_index, kind, metric, direction, len(rows), len(validation)))
 
     parent_net, parent_meta, parent_name = load_parent(rnd)
+    if parent_net is None:
+        raise RuntimeError("找不到可读父检查点，不能从零重训")
+
     paths = parse_paths(parent_meta.get("paths")) if parent_meta else []
     if not paths:
         paths = core.union_paths(rows[:200], core.MAX_FEATURES)
-        log("父模型未给出特征路径，按本数据集 inputs 结构生成 %d 维特征" % len(paths))
+        log("父模型未给出特征路径，按当前数据生成 %d 维特征" % len(paths))
     elif not usable(paths, rows):
-        # v14：父路径部分不可用（典型是 C 的阶段字段与基线不同）时，若直接重建路径，
-        # can_inherit 必然失败 → 模型从零重训、丢掉 baseline 起点。改为沿用父路径、
-        # 缺失通道填 0；覆盖度太低（<50%）才退回重建，避免整行全 0 的无效特征。
+        # 父路径在当前数据上部分缺失时，仍沿用父路径、缺失通道填 0；
+        # 只有保持列对齐，才能继续继承父权重和 Adam 状态。
         cover = path_coverage(paths, rows[:200])
-        if cover >= 0.5:
-            log("父路径覆盖 %.1f%%，沿用父路径并对缺失通道填 0（保证继承 baseline）"
-                % (cover * 100))
-        else:
-            paths = core.union_paths(rows[:200], core.MAX_FEATURES)
-            log("父路径覆盖仅 %.1f%%，改按本数据集结构生成 %d 维特征"
-                % (cover * 100, len(paths)))
-
+        log("父路径覆盖 %.1f%%，沿用父路径并对缺失通道填 0" % (cover * 100))
     x = matrix(rows, paths)
     x_validation = matrix(validation, paths)
 
@@ -339,207 +335,162 @@ def train(rnd: Round):
         target_mean, target_scale = 0.0, 1.0
 
     mean, scale = core.fit_scaler(x)
-    inherited = can_inherit(parent_net, x, kind, classes, paths)
-    if inherited:
-        mean, scale = parent_net.mean, parent_net.scale
-        if kind == "regression":
-            target_mean, target_scale = parent_net.target_mean, parent_net.target_scale
-
-    if inherited:
-        net = parent_net
-        log("继承父模型 w1%s，参数 %d 个" % (tuple(net.w1.shape), core_parameter_count(net)))
-    else:
-        net = core.Net(x.shape[1], out_dim=(len(classes) if kind == "classification" else 1),
-                       kind=kind, seed=42)
-        log("父模型与当前数据集不兼容，按 %d 维初始化新模型" % x.shape[1])
-    net.mean, net.scale = mean, scale
+    if parent_net.kind != kind or parent_net.w1.shape[0] != x.shape[1]:
+        raise RuntimeError("父检查点与当前数据维度不兼容：父 %s / 当前 %s"
+                           % (parent_net.w1.shape, x.shape[1]))
+    if kind == "classification":
+        if len(parent_net.classes) != len(classes):
+            raise RuntimeError("父检查点类别数与当前标签不一致，无法继承")
+        classes = list(parent_net.classes)
+    net = parent_net
+    net.mean, net.scale = parent_net.mean, parent_net.scale
     net.classes = classes
     net.paths = paths
-    net.target_mean, net.target_scale = target_mean, target_scale
-    parent_snapshot = copy.deepcopy(net)   # 锚定用：训前的父权重，不受 fit 原地修改影响
+    if kind == "regression":
+        net.target_mean, net.target_scale = parent_net.target_mean, parent_net.target_scale
+    else:
+        net.target_mean, net.target_scale = target_mean, target_scale
 
-    parent_score = (core.score(net, x_validation, answers_validation, classes, kind, metric)
-                    if (inherited and len(validation)) else None)
-    key_upper = str(rnd.dataset_key).upper()
-    block_count = BLOCK_COUNT_BY.get(key_upper, BLOCK_COUNT)
-    guard = USE_BLOCK_GUARD or key_upper == "C"
-    blocks = ((stage_parts(validation, answers_validation, kind, block_count)
-               if key_upper == "C" else slice_blocks(answers_validation, kind, block_count))
-              if (guard and parent_score is not None) else [])
+    parent_score = core.score(net, x_validation, answers_validation, classes, kind, metric)
+    block_count = BLOCK_COUNT_BY.get(key, BLOCK_COUNT)
+    if key == "C":
+        blocks = stage_parts(validation, answers_validation, kind, block_count)
+    elif key == "B":
+        blocks = stage_parts(validation, answers_validation, kind, block_count, group_key="bearing")
+    else:
+        blocks = slice_blocks(answers_validation, kind, block_count)
     parent_blocks = (block_scores(net, x_validation, answers_validation, classes, kind,
                                   metric, blocks) if blocks else None)
-    log("父模型验证分 %s（分段 %d 段）" % (fmt(parent_score), len(blocks)))
+    log("训练前验证分 %s（分段 %d 段）" % (fmt(parent_score), len(blocks)))
 
-    # v14：上下文压缩——只保留数据集、轮次、指标与父分，历史只带最近 2 轮，
-    # 每轮提示词体积降下来，Token 消耗随之下降。
-    context = ("%s 第%d轮 %s(%s) 父分%s"
+    if key == "B":
+        if not net.log_target:
+            net.log_target = True
+            logged = np.log1p(np.maximum(answers, 0.0))
+            net.target_mean = float(logged.mean())
+            net.target_scale = float(logged.std()) or 1.0
+            log("数据集 B 首次启用 log1p 目标（均值 %.3f 尺度 %.3f）"
+                % (net.target_mean, net.target_scale))
+        else:
+            log("数据集 B 沿用父检查点的 log1p 目标（均值 %.3f 尺度 %.3f）"
+                % (net.target_mean, net.target_scale))
+    elif key == "C":
+        if net.target_cap is None:
+            net.target_cap = 600.0
+            log("数据集 C 首次启用预测上限 600 循环")
+        else:
+            log("数据集 C 沿用父检查点的预测上限 %.0f 循环" % net.target_cap)
+
+    context = ("%s 第%d轮 %s(%s) 训练前验证分 %s"
                % (rnd.dataset_key, rnd.round_index, metric, direction, fmt(parent_score)))
     past = []
     for item in (rnd.history() or [])[-2:]:
         config = item.get("configuration") or {}
-        past.append("第%s轮 lr=%s ep=%s 候选=%s"
+        past.append("第%s轮 lr=%s ep=%s 验证前=%s 验证后=%s 决策=%s"
                     % (item.get("round_index"), config.get("learning_rate"),
-                       config.get("epochs"), fmt(config.get("candidate_score"))))
+                       config.get("epochs"), fmt(config.get("validation_before")),
+                       fmt(config.get("validation_after")),
+                       "采纳" if config.get("selected") == "candidate" else "保留父模型"))
     if past:
         context += "\n最近轮次：" + "；".join(past)
+
     receipt, choice = ask_decider(rnd, context)
+    reply = (receipt.text or "").strip()[:200]
+    lr = min(max(float(choice.get("learning_rate", 0.003)), 1e-4), 0.01)
+    epochs = min(max(int(choice.get("epochs", 3)), 1), 3)
+    batch = min(max(int(choice.get("batch_size", 64)), 16), 256)
+    log("v18 模型选择 lr=%.4g epochs=%d batch=%d call=%s reply=%s"
+        % (lr, epochs, batch, receipt.call_id, reply))
 
-    # 逐轮配方表：以镜像内配方为准执行；决策器回复被解析并记入日志，但不覆盖配方表。
-    schedule = (
-        (0.0018, 2, 128), (0.0030, 3, 64), (0.0007, 6, 64), (0.0020, 3, 64),
-        (0.0040, 3, 96), (0.0030, 5, 128), (0.0012, 4, 64), (0.0030, 2, 64),
-        (0.0007, 2, 128), (0.0050, 2, 64),
-    )
-    slot = schedule[(int(rnd.round_index) - 1) % len(schedule)]
-    choice["learning_rate"], choice["epochs"], choice["batch_size"] = slot
-    # v14：C 走微步——1 个 epoch、lr 5e-4，训完再按 0.9 的强度锚回父权重。
-    # 目的是让 C 每段相对基线拿到一点正提升（最差阶段那 5 分才有机会），
-    # 而不是像 v11 那样整段推进把 C 打穿。
-    key_upper = str(rnd.dataset_key).upper()
-    if key_upper == "C":
-        choice["learning_rate"], choice["epochs"], choice["batch_size"] = (0.0005, 2, 64)
-        log("数据集 C 采用微步配方 lr=0.0005 epochs=2 batch=64")
-    # 连续保留父模型时自动衰减学习率，避免在同一步长上反复撞墙。
-    streak = rollback_streak(rnd)
-    if DECAY_ON_ROLLBACK and streak >= 2:
-        factor = 0.5 ** min(streak - 1, 3)
-        choice["learning_rate"] = slot[0] * factor
-        log("连续 %d 轮保留父模型，学习率折算 %.4g → %.4g" % (streak, slot[0], choice["learning_rate"]))
-    log("第 %d 轮配方 lr=%s epochs=%s batch=%s（决策 call=%s，回复仅记录）"
-        % (int(rnd.round_index), choice["learning_rate"], slot[1], slot[2], receipt.call_id))
-
-    origin = "继承父权重续训" if inherited else "从零初始化"
-
-    # v13：冻结数据集（默认 C）完全不训练，只提交父检查点原样。
-    # v11 实测显示 C 十轮全部“采用本轮模型”——因为该数据集的父检查点与当前数据维度不兼容
-    # （inherited=False），冻结条件原先挂在 inherited 上，等于没生效；C 还从零重训花了
-    # 8,686 秒，把“资源效率”打到 0/5。这里改为按数据集名无条件冻结。
-    frozen = (str(rnd.dataset_key).upper() in [name.upper() for name in FREEZE_DATASETS]
-              or (str(rnd.dataset_key).upper() == "C" and not inherited))
-    total_epochs = max(1, int(choice["epochs"]))
-    batch = int(choice.get("batch_size", 128))
-    best = None
-    best_epoch = total_epochs
-    if frozen:
-        candidate_score = None
-        candidate_blocks = None
-        anchor_ratio = 0.0
-        epochs_used = 0
-        objective = None
-        best = {"ratio": 0.0, "model": parent_snapshot, "score": None, "blocks": None,
-                "objective": None, "epoch": 0}
-        log("数据集 %s 冻结：本轮不训练、不推进权重，候选提交父检查点原样" % rnd.dataset_key)
-    elif EARLY_STOP:
-        for epoch in range(1, total_epochs + 1):
-            net.fit(x, answers, epochs=1, learning_rate=choice["learning_rate"],
-                    batch_size=batch, seed=42 + 17 * epoch)
-            for ratio in ANCHOR_RATIOS:
-                model = copy.deepcopy(net) if ratio == 0.0 else anchor(parent_snapshot, net, ratio)
-                score = (core.score(model, x_validation, answers_validation, classes, kind, metric)
-                         if len(validation) else None)
-                blocks_now = (block_scores(model, x_validation, answers_validation, classes, kind,
-                                           metric, blocks) if (blocks and parent_blocks) else None)
-                objective, mean_gain, worst_gain = platform_objective(
-                    parent_score, score, direction, parent_blocks, blocks_now)
-                item = {"ratio": ratio, "model": model, "score": score, "blocks": blocks_now,
-                        "objective": objective, "mean_gain": mean_gain,
-                        "worst_gain": worst_gain, "epoch": epoch}
-                if objective is not None and (best is None or objective > best["objective"]):
-                    best, best_epoch = item, epoch
-    else:
-        # C 每轮换种子：被阶段护栏拒掉的轮次照样能给出不同的微步轨迹，
-        # 十轮里多试几个起点，命中"四段都不退"的概率更高。
-        fit_seed = (42 + int(rnd.round_index)) if str(rnd.dataset_key).upper() == "C" else 42
-        net.fit(x, answers, epochs=total_epochs, learning_rate=choice["learning_rate"],
-                batch_size=batch, seed=fit_seed)
-        model = copy.deepcopy(net)
-        score = (core.score(model, x_validation, answers_validation, classes, kind, metric)
-                 if len(validation) else None)
-        blocks_now = (block_scores(model, x_validation, answers_validation, classes, kind,
-                                   metric, blocks) if (blocks and parent_blocks) else None)
+    # 模型给出 epochs 预算；每个 epoch 后都在验证集上比较一次，
+    # 保留“平均变好且分段不崩”的最优快照，避免最后几个 epoch 把早期结果训坏。
+    best_net = None
+    best_score = parent_score
+    best_blocks = parent_blocks
+    best_objective = None
+    best_epoch = 0
+    tol = (0.0 if key == "C" else (0.01 if key == "B" else None))
+    for epoch in range(1, epochs + 1):
+        net.fit(x, answers, epochs=1, learning_rate=lr, batch_size=batch,
+                seed=42 + int(rnd.round_index) * 10 + epoch, clip=1.0)
+        epoch_score = core.score(net, x_validation, answers_validation, classes, kind, metric)
+        epoch_blocks = (block_scores(net, x_validation, answers_validation, classes, kind,
+                                     metric, blocks) if blocks else None)
         objective, mean_gain, worst_gain = platform_objective(
-            parent_score, score, direction, parent_blocks, blocks_now)
-        best = {"ratio": 0.0, "model": model, "score": score, "blocks": blocks_now,
-                "objective": objective, "mean_gain": mean_gain,
-                "worst_gain": worst_gain, "epoch": total_epochs}
-        log("候选验证分 %s（lr=%s epochs=%d batch=%d，从父检查点单次续训）"
-            % (fmt(score), choice["learning_rate"], total_epochs, batch))
+            parent_score, epoch_score, direction, parent_blocks, epoch_blocks)
+        ok, why = adopt_decision(parent_score, epoch_score, direction,
+                                 parent_blocks, epoch_blocks, worst_tol=tol)
+        if ok and objective is not None and objective <= 0:
+            ok, why = False, "加权收益不为正"
+        log("epoch %d/%d 验证分 %s，%s（%s）"
+            % (epoch, epochs, fmt(epoch_score), "保留快照" if ok else "不回退",
+               why))
+        if ok and (best_net is None or is_improved(best_score, epoch_score, direction)):
+            best_net = copy.deepcopy(net)
+            best_score = epoch_score
+            best_blocks = epoch_blocks
+            best_objective = objective
+            best_epoch = epoch
 
-    net = best["model"]
-    candidate_score = best["score"]
-    candidate_blocks = best["blocks"]
-    anchor_ratio = best["ratio"]
-    objective = best["objective"]
-    epochs_used = best["epoch"]
-    if candidate_blocks and parent_blocks:
-        log("候选分段落差 %s"
-            % " / ".join("%+.2f%%" % ((relative_gain(before, after, direction) or 0.0) * 100)
-                         for before, after in zip(parent_blocks, candidate_blocks)))
-
-
-    # 基线口径：每轮候选一律从父检查点（最终可追溯到平台基线）续训，不做从零重训分支。
-    # 平台评分对象是续训后的工业模型，保持与基线同源才能保证提升可归因。
+    if best_net is not None:
+        net = best_net
+        candidate = best_net
+        actual_epochs = best_epoch
+    else:
+        candidate = copy.deepcopy(net)
+        actual_epochs = epochs
+    candidate_score = core.score(candidate, x_validation, answers_validation, classes, kind, metric)
+    blocks_now = (block_scores(candidate, x_validation, answers_validation, classes, kind,
+                               metric, blocks) if blocks else None)
+    objective, mean_gain, worst_gain = platform_objective(
+        parent_score, candidate_score, direction, parent_blocks, blocks_now)
+    log("训练后验证分 %s（训练前 %s，采用第 %d epoch 快照）"
+        % (fmt(candidate_score), fmt(parent_score), actual_epochs))
 
     improved, adopt_reason = adopt_decision(
-        parent_score, candidate_score, direction, parent_blocks, candidate_blocks,
-        worst_tol=(0.0 if key_upper == "C" else None))
+        parent_score, candidate_score, direction, parent_blocks, blocks_now, worst_tol=tol)
     if improved and objective is not None and objective <= 0:
         improved, adopt_reason = False, "加权收益 %+.3f%% 不为正，保留父模型" % (objective * 100)
-    if frozen:
-        improved = False
-        adopt_reason = ("数据集 %s 阶段跨度大，本轮只提交父检查点、不推进权重（冻结）"
-                        % rnd.dataset_key)
     log("采纳判定：%s（%s）" % ("采纳" if improved else "保留父模型", adopt_reason))
 
     work = work_root()
     candidate_dir = unique_dir(work, "candidate-r%d" % rnd.round_index)
     candidate_dir.mkdir(parents=True, exist_ok=False)
     checkpoint = candidate_dir / "checkpoint.npz"
-    if frozen and parent_name and parent_name.endswith(".npz"):
-        try:
-            checkpoint.write_bytes(rnd.parent.path(parent_name).read_bytes())
-            log("冻结候选 = 父检查点 %s 原样复制（%d B）"
-                % (parent_name, checkpoint.stat().st_size))
-        except Exception as error:
-            log("父检查点复制失败（%s），改为保存当前权重" % error)
-            net.save(checkpoint)
-    else:
-        net.save(checkpoint, extra={
-            "dataset_key": rnd.dataset_key,
-            "round_index": rnd.round_index,
-            "metric": metric,
-            "parent_score": parent_score,
-            "candidate_score": candidate_score,
-            "learning_rate": choice["learning_rate"],
-            "epochs": choice["epochs"],
-            "anchor_ratio": anchor_ratio,
-            "epochs_used": epochs_used,
-            "model_call_id": receipt.call_id,
-        })
-
-    if frozen:
-        hypothesis = "%s：第 %d 轮冻结，不训练，直接沿用父检查点，避免阶段漂移带来的负提升。" % (
-            metric, rnd.round_index)
-    else:
-        hypothesis = "%s：在第 %d 轮把学习率取 %.4g、续训 %d 轮，验证分应从 %s 改善。" % (
-            metric, rnd.round_index, choice["learning_rate"], choice["epochs"], fmt(parent_score))
-    change_summary = "从父检查点 %s 继续 Adam 训练 %d 轮（lr=%.4g），特征 %d 维，%s。" % (
-        parent_name, choice["epochs"], choice["learning_rate"], x.shape[1],
-        origin)
+    net.save(checkpoint, extra={
+        "dataset_key": rnd.dataset_key,
+        "round_index": rnd.round_index,
+        "metric": metric,
+        "validation_before": parent_score,
+        "validation_after": candidate_score,
+        "learning_rate": lr,
+        "epochs": epochs,
+        "batch_size": batch,
+        "model_call_id": receipt.call_id,
+        "model_reply": reply,
+    })
+    hypothesis = "%s：第 %d 轮用模型选择的 lr=%.4g、%d epoch 从父检查点续训，验证分从 %s 到 %s。" % (
+        metric, rnd.round_index, lr, epochs, fmt(parent_score), fmt(candidate_score))
+    change_summary = "从父检查点 %s 继续 Adam 训练 %d 轮（lr=%.4g，batch=%d），特征 %d 维；训练前后验证分 %s → %s。" % (
+        parent_name, actual_epochs, lr, batch, x.shape[1], fmt(parent_score), fmt(candidate_score))
     submitted = rnd.submit_candidate(
         candidate_dir,
         hypothesis=clip(hypothesis),
         change_summary=clip(change_summary),
         configuration={
-            "learning_rate": choice["learning_rate"],
-            "epochs": choice["epochs"],
+            "learning_rate": lr,
+            "epochs": actual_epochs,
+            "epochs_requested": epochs,
+            "batch_size": batch,
             "features": int(x.shape[1]),
-            "parent_score": parent_score,
-            "candidate_score": candidate_score,
+            "validation_before": parent_score,
+            "validation_after": candidate_score,
             "metric": metric,
-            "anchor_ratio": anchor_ratio,
-            "epochs_used": epochs_used,
             "platform_objective": objective,
+            "mean_gain": mean_gain,
+            "worst_gain": worst_gain,
+            "model_reply": reply,
+            "selected": "candidate" if improved else "parent",
         },
         seed=42,
         checkpoint_paths=["checkpoint.npz"],
@@ -552,34 +503,41 @@ def train(rnd: Round):
     state_dir = rnd.state_workspace(state_dir)
     (state_dir / "round.json").write_text(json.dumps({
         "dataset_key": rnd.dataset_key,
-        "round_index": rnd.round_index,
+        "round_index": int(rnd.round_index),
         "metric": metric,
-        "parent_score": parent_score,
-        "candidate_score": candidate_score,
+        "validation_before": parent_score,
+        "validation_after": candidate_score,
+        "platform_objective": objective,
         "selected": "candidate" if improved else "parent",
         "adopt_reason": adopt_reason,
-        "anchor_ratio": anchor_ratio,
-        "epochs_used": epochs_used,
+        "learning_rate": lr,
+        "epochs": epochs,
+        "batch_size": batch,
+        "model_reply": reply,
+        "model_call_id": receipt.call_id,
     }, ensure_ascii=False) + "\n", encoding="utf-8")
     rnd.save_state(state_dir)
 
     history = rnd.history()
     selected = submitted["artifact_id"] if improved else rnd.parent.artifact_id
-    reason = "候选验证分 %s，父模型 %s；%s。模型调用 %s。" % (
-        fmt(candidate_score), fmt(parent_score), adopt_reason, receipt.call_id)
+    reason = "训练前 %s，训练后 %s；%s。模型选择 lr=%.4g epochs=%d batch=%d；调用 %s。" % (
+        fmt(parent_score), fmt(candidate_score), adopt_reason, lr, epochs, batch, receipt.call_id)
     rnd.finish(
         selected_artifact_id=selected,
         hypothesis=clip(hypothesis),
         change_summary=clip(change_summary),
         reason=clip(reason),
         configuration={
-            "learning_rate": choice["learning_rate"],
-            "epochs": choice["epochs"],
+            "learning_rate": lr,
+            "epochs": actual_epochs,
+            "epochs_requested": epochs,
+            "batch_size": batch,
             "features": int(x.shape[1]),
-            "parent_score": parent_score,
-            "candidate_score": candidate_score,
+            "validation_before": parent_score,
+            "validation_after": candidate_score,
             "metric": metric,
             "selected": "candidate" if improved else "parent",
+            "model_reply": reply,
         },
         seed=42,
         history_ids=[item["id"] for item in history],
