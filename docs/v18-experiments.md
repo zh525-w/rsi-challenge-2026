@@ -2,7 +2,7 @@
 
 版本：v18（Harness SDK 1.0.5）  
 镜像 tar SHA-256：`18f6c543722296c0e7991d0181852c96449e07bcea2b513102563bce30faac46`  
-本地镜像 ID：`sha256:296ffabbe67a3239...`（完整值见镜像归档配置）
+本地镜像 ID：`sha256:296ffabbe67a3239e13d340acd0e9820a17d7f7e322d7337bb1df8d8be6192f5`
 
 ## 训练口径
 
