@@ -130,8 +130,21 @@ class Net(object):
         self.classes = []
         self.paths = []
         self.step = 0
+        self.feature_mode = "raw"
+
+    def transform(self, x):
+        """按数据集做与样本顺序无关的特征变换，预测和训练必须走同一路径。"""
+        x = np.asarray(x, dtype=np.float64)
+        if self.feature_mode == "l2":
+            return x / (np.linalg.norm(x, axis=1, keepdims=True) + 1e-12)
+        if self.feature_mode == "rowstd":
+            center = x.mean(axis=1, keepdims=True)
+            spread = x.std(axis=1, keepdims=True)
+            return (x - center) / (spread + 1e-12)
+        return x
 
     def normalize(self, x):
+        x = self.transform(x)
         safe = np.where(self.scale < 1e-12, 1.0, self.scale)
         return np.clip((x - self.mean) / safe, -CLIP, CLIP)
 
@@ -215,6 +228,7 @@ class Net(object):
             "log_target": bool(self.log_target),
             "target_cap": (None if self.target_cap is None else float(self.target_cap)),
             "feature_clip": [-CLIP, CLIP],
+            "feature_mode": self.feature_mode,
             "parameter_count": int(self.w1.size + self.b1.size + self.w2.size + self.b2.size),
             "feature_count": int(self.w1.shape[0]),
             "adam_steps": self.step,
@@ -253,6 +267,7 @@ class Net(object):
             cap = meta.get("target_cap")
             net.target_cap = None if cap is None else float(cap)
             net.step = int(meta.get("adam_steps", 0))
+            net.feature_mode = str(meta.get("feature_mode") or "raw")
             return net, meta
 
 
